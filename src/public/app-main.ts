@@ -181,6 +181,17 @@ let liveSessions: LiveSession[] = [];
 let activeLiveSessionId = localStorage.getItem('tau-active-live-session-id') || null;
 let hasRestoredInitialLiveSession = false;
 let pendingExtensionUIRequests: ExtensionUIRequest[] = []; // background session UI requests waiting for that Tau tab to be selected
+
+// Embedded mode (loom Web Studio integration — see
+// docs/design/pi-tau-interactive-revision-panel.md in the loom repo):
+//   ?sessionId=<id>&embedded=1
+// When `sessionId` is present, auto-select that session as soon as it appears
+// in the WS state pushes (initial or live_session_created). When `embedded=1`,
+// hide the launcher/project-selection chrome — the iframe is meant to show
+// only the active session's chat + file browser, not the project picker.
+const EMBEDDED_QUERY = new URLSearchParams(location.search);
+const EMBEDDED_SESSION_ID = EMBEDDED_QUERY.get('sessionId');
+const EMBEDDED_MODE = EMBEDDED_QUERY.get('embedded') === '1' && !!EMBEDDED_SESSION_ID;
 dialogHandler.onIdle = () => processQueuedExtensionUIRequest();
 
 // File browser
@@ -353,6 +364,19 @@ wsClient.addEventListener('stateUpdate', (e: Event) => {
   const launcherVisible = launcherPanel.isVisible();
   hasReceivedInitialServerState = true;
   setLiveSessions(detail.liveSessions || []);
+  // Embedded mode (loom iframe): prefer the requested sessionId over the
+  // localStorage-restored one, on every state push until it lands. If the
+  // session hasn't appeared yet (loota may not have created it server-side
+  // by the time the iframe loads), stay unarmed and try again on the next
+  // push or live_session_created event below.
+  if (EMBEDDED_SESSION_ID && liveSessions.some(s => s.id === EMBEDDED_SESSION_ID)) {
+    if (activeLiveSessionId !== EMBEDDED_SESSION_ID) {
+      activeLiveSessionId = EMBEDDED_SESSION_ID;
+      void selectLiveSession(EMBEDDED_SESSION_ID);
+      hasRestoredInitialLiveSession = true;
+      return;
+    }
+  }
   if (!hasRestoredInitialLiveSession || (wasViewingLive && !launcherVisible)) {
     hasRestoredInitialLiveSession = true;
     restoreActiveLiveSession();
@@ -369,7 +393,14 @@ wsClient.addEventListener('stateUpdate', (e: Event) => {
 });
 
 wsClient.addEventListener('liveSessionCreated', (e: Event) => {
-  upsertLiveSession((e as CustomEvent<LiveSession>).detail);
+  const session = (e as CustomEvent<LiveSession>).detail;
+  upsertLiveSession(session);
+  // Embedded mode: when loom's prepare API creates the live session after
+  // the iframe has already loaded, the stateUpdate above may have missed it.
+  // Catch it here.
+  if (EMBEDDED_SESSION_ID && session.id === EMBEDDED_SESSION_ID && activeLiveSessionId !== EMBEDDED_SESSION_ID) {
+    void selectLiveSession(EMBEDDED_SESSION_ID);
+  }
 });
 
 wsClient.addEventListener('liveSessionUpdated', (e: Event) => {
@@ -2187,7 +2218,12 @@ updateLiveSessionInputState();
 sidebar.loadSessions().then(() => {
   updateLiveSessionIndicators();
 });
-launcherPanel.init();
+// Embedded mode: skip the launcher init (no project-selection chrome inside
+// the loom iframe). The active session is auto-selected via the stateUpdate
+// and liveSessionCreated handlers above.
+if (!EMBEDDED_MODE) {
+  launcherPanel.init();
+}
 
 // Register service worker for PWA
 if ('serviceWorker' in navigator) {
